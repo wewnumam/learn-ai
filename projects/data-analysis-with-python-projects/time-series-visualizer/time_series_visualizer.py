@@ -7,7 +7,6 @@ register_matplotlib_converters()
 # Import data (Make sure to parse dates. Consider setting index column to 'date'.)
 df = pd.read_csv('fcc-forum-pageviews.csv')
 df['date'] = pd.to_datetime(df['date'])
-df = df.set_index('date')
 
 # Clean data
 lower = df['value'].quantile(0.025)
@@ -18,10 +17,10 @@ df = df[(df['value'] >= lower) & (df['value'] <= upper)]
 def draw_line_plot():
     # Draw line plot
     fig, ax = plt.subplots(figsize=(16, 5))
+    ax.plot(df, 'r')
     ax.set_title('Daily freeCodeCamp Forum Page Views 5/2016-12/2019')
     ax.set_xlabel('Date')
     ax.set_ylabel('Page Views')
-    ax.plot(df, 'r')
 
     # Save image and return fig (don't change this part)
     fig.savefig('line_plot.png')
@@ -29,14 +28,13 @@ def draw_line_plot():
 
 def draw_bar_plot():
     # Copy and modify data for monthly bar plot
-    df['year'] = df.index.year
-    df['month'] = df.index.month_name()
-    df_bar = df.groupby(['year', 'month'])['value'].sum().unstack()
-    month_order = [
-        'January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'
-    ]
-    df_bar = df_bar[month_order]
+    df_bar = df.copy()
+    df_bar['year'] = df_bar['date'].dt.year
+    df_bar['month'] = df_bar['date'].dt.strftime('%B')
+    month_order = ['January', 'February', 'March', 'April', 'May', 'June',
+               'July', 'August', 'September', 'October', 'November', 'December']
+    df_bar['month'] = pd.Categorical(df_bar['month'], categories=month_order, ordered=True)
+    df_bar = df_bar.groupby(['year', 'month'])['value'].sum().unstack()
 
     # Draw bar plot
     fig = df_bar.plot(kind='bar', figsize=(10, 6)).figure
