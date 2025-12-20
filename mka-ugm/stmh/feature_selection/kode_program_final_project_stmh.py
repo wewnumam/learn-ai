@@ -375,6 +375,7 @@ if not os.path.exists(excel_path):
         "model_ml",
         "fitness",
         "representasi_kromosom_biner",
+        "jumlah_fitur_terpilih",
         "fitur_terpilih"
     ])
     df_init.to_excel(excel_path, index=False)
@@ -395,18 +396,31 @@ print(f"\n📁 Menyimpan log ke Excel sebagai percobaan #{percobaan_id}")
 rows_to_append = []
 
 for name, res in results.items():
-    for log in res["detailed_feature_log"]:
+    detailed_log = res["detailed_feature_log"]
+
+    for log in detailed_log:
         gen = log["gen"]
         fitness = log["fitness"]
         fitur = log["features"]
-        krom = results[name]["best_individual"]  # kromosom terbaik versi GA, bentuk list 0/1
+
+        # REKONSTRUKSI KROMOSOM BERDASARKAN FITUR TERPILIH AIAP GENERASI
+        kromosom = []
+        for feat in feature_names:
+            if feat in fitur:
+                kromosom.append("1")
+            else:
+                kromosom.append("0")
+
+        kromosom_biner = "".join(kromosom)
+        jumlah_fitur = sum(1 for x in kromosom if x == "1")
 
         rows_to_append.append({
             "percobaan": percobaan_id,
             "generasi": gen,
             "model_ml": name,
             "fitness": fitness,
-            "representasi_kromosom_biner": "".join(map(str, krom)),
+            "representasi_kromosom_biner": kromosom_biner,
+            "jumlah_fitur_terpilih": jumlah_fitur,
             "fitur_terpilih": ", ".join(fitur)
         })
 
@@ -416,5 +430,6 @@ with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="ov
     df_append.to_excel(writer, index=False, header=False, startrow=writer.sheets['Sheet1'].max_row)
     
 print(f"✅ Selesai menyimpan {len(df_append)} baris log generasi ke Excel.")
+
 
 print("\nProgram Selesai.")
