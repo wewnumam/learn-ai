@@ -1,3 +1,6 @@
 ﻿.ipynb_checkpoints
 __pycache__
 .vscode/
+projects/scraping/csv.csv
+projects/scraping/html.html
+projects/rag/.env
