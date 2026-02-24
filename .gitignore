@@ -4,3 +4,4 @@ __pycache__
 projects/scraping/csv.csv
 projects/scraping/html.html
 projects/rag/.env
+*.pdf
