@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Extended stock analysis and forecasting script for IDX.
 
 pip install yfinance ta tensorflow scikit-learn pandas numpy matplotlib seaborn pmdarima neuralforecast
@@ -18,6 +18,26 @@ from IPython.display import display
 
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
+
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    optuna = None  # type: ignore[assignment]
+    OPTUNA_AVAILABLE = False
+    logging.warning(
+        "The `optuna` package is not installed. Hyperparameter tuning will fall back to default parameters."
+    )
+
+try:
+    from scipy.optimize import minimize
+    SCIPY_OPTIMIZE_AVAILABLE = True
+except ImportError:
+    minimize = None  # type: ignore[assignment]
+    SCIPY_OPTIMIZE_AVAILABLE = False
+    logging.warning(
+        "The `scipy` package is not installed. Markowitz optimization will fall back to equal weights."
+    )
 
 try:
     from pmdarima import auto_arima
@@ -48,10 +68,26 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 sns.set(style="whitegrid")
 
-TICKERS: List[str] = ["GOTO.JK", "MTDL.JK", "DCII.JK", "MLPT.JK", "BUKA.JK"]
-TARGET_TICKER: str = "GOTO.JK"
+# Configure pandas display options to show full table without cutting/truncating cell content
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", None)
+pd.set_option("display.max_colwidth", None)
+pd.set_option("display.width", 1000)
+
+TICKERS: List[str] = ['AAPL',  # Apple Inc.
+                      'AXP',   # American Express Co.
+                      'KO',    # Coca-Cola Co.
+                      'BAC',   # Bank of America Corp.
+                      'CVX',   # Chevron Corp.
+                      'MCO',   # Moody's Corporation
+                      'OXY',   # Occidental Petroleum Corp.
+                      'CB',    # Chubb Ltd.
+                      'KHC',   # Kraft Heinz Co.
+                      'GOOGL'  # Alphabet Inc. Class A
+                      ]
+TARGET_TICKER: str = "AAPL"
 LOOK_BACK: int = 60
-FORECAST_HORIZON: int = 30
+FORECAST_HORIZON: int = 120  # 6 months * 20 trading days
 RISK_FREE_RATE: float = 0.05
 
 
@@ -175,22 +211,69 @@ def tune_lstm_hyperparameters(
     look_back: int,
     train_ratio: float = 0.8,
 ) -> Dict[str, Any]:
-    """Return fixed LSTM model hyperparameters without tuning."""
-    X, _ = create_lstm_dataset(df_target, features, look_back)
+    """Dynamically tune LSTM model hyperparameters using Optuna to minimize validation RMSE."""
+    X, y = create_lstm_dataset(df_target, features, look_back)
     if len(X) == 0:
         raise ValueError("Not enough data to create LSTM sequences.")
 
-    fixed_params = {
-        "units1": 32,
-        "units2": 50,
-        "dropout_rate": 0.2457,
-        "dense_units": 25,
-        "learning_rate": 0.00267,
-        "batch_size": 16,
-        "epochs": 20,
-    }
-    logging.info("Using fixed LSTM parameters: %s", fixed_params)
-    return {"rmse": None, "params": fixed_params, "history": None}
+    n_train = int(len(X) * train_ratio)
+    X_train, X_test = X[:n_train], X[n_train:]
+    y_train, y_test = y[:n_train], y[n_train:]
+
+    X_train_scaled, X_test_scaled, scaler = scale_lstm_dataset(X_train, X_test)
+    close_scaler = MinMaxScaler(feature_range=(0, 1))
+    close_scaler.fit(y_train.reshape(-1, 1))
+    y_train_scaled = close_scaler.transform(y_train.reshape(-1, 1)).reshape(-1)
+
+    def objective(trial):
+        units1 = trial.suggest_int("units1", 32, 128)
+        units2 = trial.suggest_int("units2", 32, 128)
+        dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.3)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+
+        model = build_lstm_model(
+            (X_train_scaled.shape[1], X_train_scaled.shape[2]),
+            units1=units1,
+            units2=units2,
+            dropout_rate=dropout_rate,
+            dense_units=25,
+            learning_rate=learning_rate,
+        )
+        model.fit(
+            X_train_scaled,
+            y_train_scaled,
+            epochs=20,
+            batch_size=batch_size,
+            verbose=0,
+            validation_split=0.1,
+        )
+        preds_scaled = model.predict(X_test_scaled, verbose=0).reshape(-1)
+        preds = close_scaler.inverse_transform(preds_scaled.reshape(-1, 1)).reshape(-1)
+        rmse = np.sqrt(mean_squared_error(y_test, preds))
+        return rmse
+
+    if OPTUNA_AVAILABLE and optuna is not None:
+        logging.info("Starting Optuna hyperparameter tuning for LSTM...")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=10)
+        best_params = study.best_params
+        best_params["dense_units"] = 25
+        best_params["epochs"] = 20
+        logging.info("Best LSTM parameters found: %s with RMSE: %.4f", best_params, study.best_value)
+        return {"rmse": study.best_value, "params": best_params, "history": None}
+    else:
+        fixed_params = {
+            "units1": 32,
+            "units2": 50,
+            "dropout_rate": 0.2,
+            "dense_units": 25,
+            "learning_rate": 1e-3,
+            "batch_size": 32,
+            "epochs": 20,
+        }
+        logging.info("Optuna not available. Using fixed LSTM parameters: %s", fixed_params)
+        return {"rmse": None, "params": fixed_params, "history": None}
 
 
 def tune_nhits_hyperparameters(
@@ -198,17 +281,71 @@ def tune_nhits_hyperparameters(
     train_dates: pd.DatetimeIndex,
     forecast_horizon: int,
 ) -> Dict[str, Any]:
-    """Return fixed N-HiTS model hyperparameters without tuning."""
+    """Dynamically tune N-HiTS model hyperparameters using Optuna to minimize validation loss."""
     if not NEURALFORECAST_AVAILABLE or NeuralForecast is None or NHITS is None:
         logging.warning("neuralforecast is not installed. Skipping N-HiTS model.")
         return {"best_params": None, "best_score": None, "results": []}
 
-    fixed_params = {
-        "max_steps": 200,
-        "learning_rate": 1e-3,
-    }
-    logging.info("Using fixed N-HiTS parameters: %s", fixed_params)
-    return {"best_params": fixed_params, "best_score": None, "results": [{"params": fixed_params, "val_loss": None}]}
+    if len(y_train) <= forecast_horizon:
+        logging.warning("Not enough training data for N-HiTS tuning. Skipping.")
+        return {"best_params": None, "best_score": None, "results": []}
+
+    def objective(trial):
+        max_steps = trial.suggest_int("max_steps", 100, 500)
+        learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+
+        try:
+            df_train = pd.DataFrame(
+                {
+                    "unique_id": ["IDX"] * len(train_dates),
+                    "ds": train_dates,
+                    "y": y_train,
+                }
+            )
+
+            class ValLossCallback:
+                def __init__(self):
+                    self.val_loss = float("inf")
+                def on_validation_epoch_end(self, trainer, pl_module):
+                    metrics = trainer.callback_metrics
+                    if "valid_loss" in metrics:
+                        self.val_loss = float(metrics["valid_loss"])
+
+            callback = ValLossCallback()
+
+            model = NHITS(
+                h=forecast_horizon,
+                input_size=LOOK_BACK,
+                batch_size=32,
+                max_steps=max_steps,
+                early_stop_patience_steps=5,
+                val_check_steps=10,
+                learning_rate=learning_rate,
+                callbacks=[callback],
+                enable_checkpointing=False,
+                logger=False,
+            )
+            nf = NeuralForecast(models=[model], freq="D")
+            nf.fit(df=df_train, val_size=forecast_horizon)
+
+            return callback.val_loss
+        except Exception:
+            return float("inf")
+
+    if OPTUNA_AVAILABLE and optuna is not None:
+        logging.info("Starting Optuna hyperparameter tuning for N-HiTS...")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=5)
+        best_params = study.best_params
+        logging.info("Best N-HiTS parameters found: %s", best_params)
+        return {"best_params": best_params, "best_score": study.best_value, "results": []}
+    else:
+        fixed_params = {
+            "max_steps": 200,
+            "learning_rate": 1e-3,
+        }
+        logging.info("Optuna not available. Using fixed N-HiTS parameters: %s", fixed_params)
+        return {"best_params": fixed_params, "best_score": None, "results": []}
 
 
 def plot_loss_history(history: Dict[str, List[float]], title: str = "Training and Validation Loss") -> None:
@@ -660,7 +797,7 @@ def plot_return_histograms(all_stocks_data: pd.DataFrame, tickers: List[str]) ->
 
 
 def plot_risk_return(all_stocks_data: pd.DataFrame, tickers: List[str]) -> None:
-    """Plot investment risk versus return for each stock using daily returns."""
+    """Plot investment risk versus return for each stock using annualized returns and volatility."""
     stats: List[Dict[str, float]] = []
     for ticker in tickers:
         if ('Close', ticker) not in all_stocks_data.columns:
@@ -677,11 +814,18 @@ def plot_risk_return(all_stocks_data: pd.DataFrame, tickers: List[str]) -> None:
             logging.warning("Not enough data to calculate daily returns for %s", ticker)
             continue
 
+        # Annualized return = daily mean * 252 * 100
+        # Annualized risk = daily std * sqrt(252) * 100
+        ann_return = float(daily_returns.mean() * 252 * 100)
+        ann_risk = float(daily_returns.std() * np.sqrt(252) * 100)
+        sharpe = (ann_return / 100 - RISK_FREE_RATE) / (ann_risk / 100) if ann_risk > 0 else 0.0
+
         stats.append(
             {
                 'ticker': ticker,
-                'Return (%)': float(daily_returns.mean() * 100),
-                'Risk (%)': float(daily_returns.std() * 100),
+                'Annualized Return (%)': ann_return,
+                'Annualized Risk (%)': ann_risk,
+                'Sharpe Ratio': sharpe,
             }
         )
 
@@ -691,27 +835,49 @@ def plot_risk_return(all_stocks_data: pd.DataFrame, tickers: List[str]) -> None:
 
     risk_return_df = pd.DataFrame(stats).set_index('ticker')
 
-    fig, ax = plt.subplots(figsize=(11, 8))
-    sns.scatterplot(
-        data=risk_return_df.reset_index(),
-        x='Risk (%)',
-        y='Return (%)',
-        hue='ticker',
-        palette='tab10',
-        s=140,
-        ax=ax,
-        legend='brief',
+    fig, ax = plt.subplots(figsize=(12, 8))
+    # Scatter plot color-coded by Sharpe Ratio using the viridis colormap
+    scatter = ax.scatter(
+        risk_return_df['Annualized Risk (%)'],
+        risk_return_df['Annualized Return (%)'],
+        c=risk_return_df['Sharpe Ratio'],
+        cmap='viridis',
+        s=150,
+        edgecolors='black',
+        alpha=0.9,
+        zorder=3,
     )
+    
+    # Add colorbar for Sharpe Ratio
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label('Sharpe Ratio', fontsize=12)
 
+    # Label placement directly on top of the scatter points
     for ticker, row in risk_return_df.iterrows():
-        ax.text(row['Risk (%)'] + 0.01, row['Return (%)'] + 0.01, ticker, fontsize=10)
+        x_val = row['Annualized Risk (%)']
+        y_val = row['Annualized Return (%)']
+        ax.text(
+            x_val,
+            y_val + 0.35,  # Offset vertically above the point
+            ticker,
+            fontsize=10,
+            fontweight='bold',
+            ha='center',
+            va='bottom',
+            zorder=4,
+        )
 
-    ax.set_title('Stock Investment Risk vs Return')
-    ax.set_xlabel('Daily Return Volatility (Std Dev %)')
-    ax.set_ylabel('Mean Daily Return (%)')
-    ax.axhline(0, color='gray', linestyle='--', alpha=0.6)
-    ax.axvline(risk_return_df['Risk (%)'].mean(), color='gray', linestyle=':', alpha=0.6)
-    ax.grid(True, alpha=0.4)
+    ax.set_title('Stock Investment Annualized Risk vs Return (Sharpe Ratio Analysis)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Annualized Volatility / Risk (%)', fontsize=12)
+    ax.set_ylabel('Annualized Expected Return (%)', fontsize=12)
+    
+    # Reference lines
+    ax.axhline(RISK_FREE_RATE * 100, color='red', linestyle='--', alpha=0.7, label=f'Risk-Free Rate ({RISK_FREE_RATE*100:.1f}%)')
+    ax.axvline(risk_return_df['Annualized Risk (%)'].mean(), color='gray', linestyle=':', alpha=0.6, label='Mean Risk')
+    ax.axhline(risk_return_df['Annualized Return (%)'].mean(), color='gray', linestyle=':', alpha=0.6, label='Mean Return')
+    
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left')
     plt.tight_layout()
     plt.show()
 
@@ -921,15 +1087,56 @@ def compare_models(
     logging.info("Model comparison metrics:")
     display(metrics_df[["Model Params", *metric_names, *[f"Winner_{m}" for m in metric_names]]].round(4))
 
-    plt.figure(figsize=(14, 7))
+    # Create two subplots: main prediction comparison on top, residuals on bottom
+    fig, (ax_main, ax_res) = plt.subplots(2, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    
+    line_styles = {
+        "Naive": ":",
+        "ARIMA": "-.",
+        "LSTM": "-",
+        "N-HiTS": "--",
+    }
+    
+    # Plot Actual close price first with a thick, distinct line on main plot
+    ax_main.plot(test_dates, y_test, label="Actual Close", color="black", linewidth=2.5, zorder=3)
+    
+    # Plot model predictions
     for model_name, preds in model_predictions.items():
-        plt.plot(test_dates, preds, label=model_name)
-    plt.plot(test_dates, y_test, label="Actual", color="black", linewidth=2, linestyle="--")
-    plt.title(f"Model Comparison on {ticker} Test Set")
-    plt.xlabel("Date")
-    plt.ylabel("Close Price (IDR)")
-    plt.legend()
-    plt.grid(True)
+        style = line_styles.get(model_name, "-")
+        ax_main.plot(test_dates, preds, label=f"{model_name} Forecast", linestyle=style, linewidth=1.8)
+        
+    ax_main.set_title(f"Model Comparison on {ticker} Test Set", fontsize=14, fontweight='bold')
+    ax_main.set_ylabel("Close Price (IDR)", fontsize=12)
+    ax_main.legend(loc="upper left")
+    ax_main.grid(True, alpha=0.4)
+    
+    # Create evaluation metrics summary text block
+    metrics_text = "Model Test Metrics:\n" + "\n".join(
+        f"{model}: MAE={metrics['MAE']:.2f}, RMSE={metrics['RMSE']:.2f}, MAPE={metrics['MAPE']:.2f}%"
+        for model, metrics in metrics_table.items()
+    )
+    
+    # Add metrics summary box to the main plot
+    ax_main.text(
+        0.02, 0.05, metrics_text,
+        transform=ax_main.transAxes,
+        fontsize=9,
+        verticalalignment='bottom',
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='gray')
+    )
+    
+    # Plot residuals on the bottom plot
+    for model_name, preds in model_predictions.items():
+        residuals = y_test - preds
+        style = line_styles.get(model_name, "-")
+        ax_res.plot(test_dates, residuals, label=f"{model_name} Residual", linestyle=style, alpha=0.8)
+        
+    ax_res.axhline(0, color="black", linestyle="--", alpha=0.6)
+    ax_res.set_ylabel("Residual (Actual - Pred)", fontsize=11)
+    ax_res.set_xlabel("Date", fontsize=12)
+    ax_res.grid(True, alpha=0.4)
+    ax_res.legend(loc="upper left", fontsize=8)
+    
     plt.tight_layout()
     plt.show()
 
@@ -947,17 +1154,248 @@ def compare_models(
     )
 
 
+def plot_jci_usd_context(period: str = "1y") -> None:
+    """Download and plot JCI (^JKSE) and USD/IDR (IDR=X) to show market conditions."""
+    logging.info("Downloading JCI (^JKSE) and USD/IDR (IDR=X) exchange rate data for context...")
+    try:
+        jci = yf.download("^JKSE", period=period, progress=False)
+        usd_idr = yf.download("IDR=X", period=period, progress=False)
+        
+        if jci.empty or usd_idr.empty:
+            logging.warning("Could not download context data for JCI or USD/IDR.")
+            return
+
+        # Align datasets by index
+        combined = pd.DataFrame({
+            "JCI": jci["Close"],
+            "USD_IDR": usd_idr["Close"]
+        }).dropna()
+
+        fig, ax1 = plt.subplots(figsize=(14, 6))
+
+        color = '#0b3d91'
+        ax1.set_xlabel('Date', fontsize=12)
+        ax1.set_ylabel('JCI Index Value', color=color, fontsize=12)
+        ax1.plot(combined.index, combined['JCI'], color=color, label='JCI Index (^JKSE)', linewidth=2)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.grid(True, alpha=0.3)
+
+        ax2 = ax1.twinx()  
+        color = '#d62728'
+        ax2.set_ylabel('USD/IDR Exchange Rate', color=color, fontsize=12)
+        ax2.plot(combined.index, combined['USD_IDR'], color=color, label='USD/IDR (IDR=X)', linewidth=2, linestyle='--')
+        ax2.tick_params(axis='y', labelcolor=color)
+
+        plt.title('Indonesian Market Context: JCI Index vs. USD/IDR Exchange Rate', fontsize=14, fontweight='bold')
+        fig.tight_layout()  
+        
+        # Combine legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        
+        plt.show()
+    except Exception as e:
+        logging.warning("Failed to plot JCI and USD/IDR context: %s", e)
+
+
+def get_usd_idr_rate() -> float:
+    """Fetch the current USD to IDR exchange rate."""
+    try:
+        idr_data = yf.download("IDR=X", period="1d", progress=False)
+        if not idr_data.empty and "Close" in idr_data.columns:
+            return float(idr_data["Close"].iloc[-1])
+    except Exception as e:
+        logging.warning("Failed to fetch USD/IDR rate: %s. Using fallback 16,000.", e)
+    return 16000.0
+
+
+def markowitz_optimization(
+    expected_returns: np.ndarray,
+    cov_matrix: np.ndarray,
+    risk_free_rate: float = 0.05
+) -> np.ndarray:
+    """
+    Perform Markowitz Mean-Variance Optimization to find the Maximum Sharpe Ratio Portfolio.
+    """
+    if not SCIPY_OPTIMIZE_AVAILABLE or minimize is None:
+        logging.warning("scipy.optimize not available. Falling back to equal weights.")
+        return np.ones(len(expected_returns)) / len(expected_returns)
+
+    num_assets = len(expected_returns)
+    
+    def portfolio_performance(weights):
+        port_return = np.sum(expected_returns * weights)
+        port_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+        sharpe_ratio = (port_return - risk_free_rate) / port_volatility
+        return -sharpe_ratio  # Minimize negative Sharpe ratio
+
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0})
+    bounds = tuple((0.0, 0.5) for _ in range(num_assets))  # No short selling, max 50% per asset
+    initial_guess = np.ones(num_assets) / num_assets
+
+    result = minimize(
+        portfolio_performance,
+        initial_guess,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints
+    )
+    
+    if result.success:
+        return result.x
+    else:
+        logging.warning("Markowitz optimization failed: %s. Falling back to equal weights.", result.message)
+        return initial_guess
+
+
+def analyze_and_allocate_portfolio(
+    all_stocks_data: pd.DataFrame,
+    tickers: List[str],
+    future_forecasts_all: Dict[str, np.ndarray],
+    investment_idr: float = 1_000_000_000_000.0,
+    top_n: int = 5,
+    weighting_method: str = "markowitz",  # "markowitz" or "return_proportional"
+    model_name: str = "Unknown"
+) -> pd.DataFrame:
+    """
+    Select top N stocks based on projected 6-month return, allocate weights 
+    using the specified method (Markowitz Optimization or Return-Proportional), and calculate expected profit.
+    """
+    usd_idr_rate = get_usd_idr_rate()
+    investment_usd = investment_idr / usd_idr_rate
+    logging.info("[%s Model] Current USD/IDR rate: %.2f. Investment in USD: $%.2f", model_name, usd_idr_rate, investment_usd)
+
+    projections: List[Dict[str, Any]] = []
+    for ticker in tickers:
+        if ticker not in future_forecasts_all:
+            continue
+        
+        forecast = future_forecasts_all[ticker]
+        if len(forecast) == 0:
+            continue
+            
+        last_price = all_stocks_data["Close"][ticker].dropna().iloc[-1]
+        projected_price = forecast[-1]
+        projected_return = (projected_price - last_price) / last_price
+        
+        projections.append({
+            "Ticker": ticker,
+            "Last_Price": last_price,
+            "Projected_Price_6M": projected_price,
+            "Projected_Return": projected_return,
+        })
+
+    proj_df = pd.DataFrame(projections)
+    if proj_df.empty:
+        logging.warning("[%s Model] No projections available for portfolio allocation.", model_name)
+        return pd.DataFrame()
+
+    # Sort by projected return descending and select top N
+    proj_df = proj_df.sort_values(by="Projected_Return", ascending=False).head(top_n)
+    selected_tickers = proj_df["Ticker"].tolist()
+    
+    # Calculate historical covariance matrix (annualized)
+    close_prices = pd.DataFrame({ticker: all_stocks_data["Close"][ticker] for ticker in selected_tickers})
+    daily_returns = close_prices.pct_change().dropna()
+    cov_matrix = daily_returns.cov().values * 252  # Annualized covariance
+    
+    # Expected returns
+    expected_returns = proj_df["Projected_Return"].values
+    
+    if weighting_method == "return_proportional":
+        # Proportional weights: w_i = R_i / sum(R_j)
+        # Shift to positive values if any are negative to maintain proportionality
+        min_ret = expected_returns.min()
+        if min_ret < 0:
+            adjusted_returns = expected_returns - min_ret + 1e-5
+        else:
+            adjusted_returns = expected_returns
+            
+        optimal_weights = adjusted_returns / adjusted_returns.sum()
+        logging.info("[%s Model] Allocating weights proportional to projected returns...", model_name)
+        label = f"{model_name} Return-Proportional Portfolio"
+    else:
+        # Perform Markowitz Optimization
+        optimal_weights = markowitz_optimization(expected_returns, cov_matrix, risk_free_rate=RISK_FREE_RATE)
+        logging.info("[%s Model] Allocating weights using Markowitz Optimization (Max Sharpe)...", model_name)
+        label = f"{model_name} Max Sharpe Ratio Portfolio"
+    
+    proj_df["Weight"] = optimal_weights
+    proj_df["Allocated_USD"] = investment_usd * optimal_weights
+    proj_df["Allocated_IDR"] = investment_idr * optimal_weights
+    proj_df["Expected_Profit_USD"] = proj_df["Allocated_USD"] * proj_df["Projected_Return"]
+    proj_df["Expected_Profit_IDR"] = proj_df["Expected_Profit_USD"] * usd_idr_rate
+
+    print("\n" + "="*80)
+    title_suffix = "Return-Proportional Weighting" if weighting_method == "return_proportional" else "Markowitz Max Sharpe Ratio"
+    print(f"TOP {top_n} STOCKS FOR 6-MONTH INVESTMENT ({model_name} Model - {title_suffix})")
+    print("="*80)
+    display(proj_df.round(4))
+    
+    total_expected_profit_idr = proj_df["Expected_Profit_IDR"].sum()
+    print(f"\nTotal Expected Portfolio Profit in 6 Months: IDR {total_expected_profit_idr:,.2f}")
+    print(f"Total Expected Portfolio Profit in 6 Months: USD ${proj_df['Expected_Profit_USD'].sum():,.2f}")
+    print("="*80 + "\n")
+    
+    # Plot Efficient Frontier
+    plot_efficient_frontier(daily_returns, optimal_weights, selected_tickers, label=label)
+    
+    return proj_df
+
+
+def plot_efficient_frontier(
+    daily_returns: pd.DataFrame,
+    optimal_weights: np.ndarray,
+    tickers: List[str],
+    num_portfolios: int = 10000,
+    label: str = "Max Sharpe Ratio Portfolio"
+) -> None:
+    """Plot the Efficient Frontier and mark the designated portfolio."""
+    num_assets = len(tickers)
+    results = np.zeros((3, num_portfolios))
+    
+    for i in range(num_portfolios):
+        weights = np.random.random(num_assets)
+        weights /= np.sum(weights)
+        
+        port_return = np.sum(daily_returns.mean() * weights) * 252
+        port_volatility = np.sqrt(np.dot(weights.T, np.dot(daily_returns.cov() * 252, weights)))
+        sharpe_ratio = (port_return - RISK_FREE_RATE) / port_volatility
+        
+        results[0, i] = port_volatility
+        results[1, i] = port_return
+        results[2, i] = sharpe_ratio
+        
+    results_frame = pd.DataFrame(results.T, columns=['Volatility', 'Return', 'Sharpe'])
+    
+    plt.figure(figsize=(10, 6))
+    plt.scatter(results_frame['Volatility'], results_frame['Return'], c=results_frame['Sharpe'], cmap='viridis', marker='o', alpha=0.3)
+    plt.colorbar(label='Sharpe Ratio')
+    
+    # Mark optimal portfolio
+    opt_return = np.sum(daily_returns.mean() * optimal_weights) * 252
+    opt_volatility = np.sqrt(np.dot(optimal_weights.T, np.dot(daily_returns.cov() * 252, optimal_weights)))
+    plt.scatter(opt_volatility, opt_return, color='red', s=100, marker='*', label=label)
+    
+    plt.title(f'Efficient Frontier with {label}')
+    plt.xlabel('Expected Volatility (Annualized)')
+    plt.ylabel('Expected Return (Annualized)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
 def compute_portfolio_metrics(data: pd.DataFrame, tickers: List[str], weights: Optional[List[float]] = None) -> pd.DataFrame:
-    """Compute portfolio metrics for each ticker and an equal-weight portfolio."""
+    """Compute portfolio metrics for each ticker, an equal-weight portfolio, and the optimized portfolio."""
     close_prices = pd.DataFrame({ticker: data["Close"][ticker] for ticker in tickers})
     daily_returns = close_prices.pct_change().dropna()
-    if weights is None:
-        weights = [1.0 / len(tickers)] * len(tickers)
-    weights_arr = np.array(weights, dtype=float)
-    portfolio_returns = daily_returns.dot(weights_arr)
-
+    
     summary: Dict[str, Dict[str, float]] = {}
     annual_factor = 252.0
+    
+    # Individual ticker metrics
     for ticker in tickers:
         mean_ret = daily_returns[ticker].mean()
         vol = daily_returns[ticker].std()
@@ -970,17 +1408,35 @@ def compute_portfolio_metrics(data: pd.DataFrame, tickers: List[str], weights: O
             "Max Drawdown": float(drawdown.min()),
         }
 
-    cum_portfolio = (1 + portfolio_returns).cumprod()
-    port_drawdown = cum_portfolio / cum_portfolio.cummax() - 1
-    summary["Portfolio"] = {
-        "Annualised Return": float((1 + portfolio_returns.mean()) ** annual_factor - 1),
-        "Annualised Volatility": float(portfolio_returns.std() * np.sqrt(annual_factor)),
-        "Sharpe Ratio": float(((1 + portfolio_returns.mean()) ** annual_factor - 1 - RISK_FREE_RATE) / (portfolio_returns.std() * np.sqrt(annual_factor)) if portfolio_returns.std() > 0 else np.nan),
-        "Max Drawdown": float(port_drawdown.min()),
+    # Equal-weight portfolio metrics
+    equal_weights = np.array([1.0 / len(tickers)] * len(tickers), dtype=float)
+    equal_portfolio_returns = daily_returns.dot(equal_weights)
+    cum_equal = (1 + equal_portfolio_returns).cumprod()
+    port_drawdown_equal = cum_equal / cum_equal.cummax() - 1
+    
+    summary["Equal Weight Portfolio"] = {
+        "Annualised Return": float((1 + equal_portfolio_returns.mean()) ** annual_factor - 1),
+        "Annualised Volatility": float(equal_portfolio_returns.std() * np.sqrt(annual_factor)),
+        "Sharpe Ratio": float(((1 + equal_portfolio_returns.mean()) ** annual_factor - 1 - RISK_FREE_RATE) / (equal_portfolio_returns.std() * np.sqrt(annual_factor)) if equal_portfolio_returns.std() > 0 else np.nan),
+        "Max Drawdown": float(port_drawdown_equal.min()),
     }
 
+    # Optimized portfolio metrics (if weights provided)
+    if weights is not None:
+        weights_arr = np.array(weights, dtype=float)
+        opt_portfolio_returns = daily_returns.dot(weights_arr)
+        cum_opt = (1 + opt_portfolio_returns).cumprod()
+        port_drawdown_opt = cum_opt / cum_opt.cummax() - 1
+        
+        summary["Optimized Portfolio (Max Sharpe)"] = {
+            "Annualised Return": float((1 + opt_portfolio_returns.mean()) ** annual_factor - 1),
+            "Annualised Volatility": float(opt_portfolio_returns.std() * np.sqrt(annual_factor)),
+            "Sharpe Ratio": float(((1 + opt_portfolio_returns.mean()) ** annual_factor - 1 - RISK_FREE_RATE) / (opt_portfolio_returns.std() * np.sqrt(annual_factor)) if opt_portfolio_returns.std() > 0 else np.nan),
+            "Max Drawdown": float(port_drawdown_opt.min()),
+        }
+
     summary_df = pd.DataFrame(summary).T
-    print("\nPortfolio metrics:")
+    print("\nPortfolio metrics comparison:")
     display(summary_df.round(4))
     return summary_df
 
@@ -1000,32 +1456,64 @@ def plot_forecast_chart(
     historical_prices = df_target["Close"].iloc[-90:]
     forecast_dates = pd.date_range(start=df_target.index[-1] + pd.Timedelta(days=1), periods=horizon, freq="D")
 
-    plt.figure(figsize=(16, 8))
-    plt.plot(historical_dates, historical_prices, label="Historical Close", color="#0b3d91")
-    plt.plot(test_dates, y_test, label="Test Actual", color="#2ca02c", linestyle="--")
-    plt.plot(test_dates, lstm_preds, label="LSTM Test Predictions", color="#ff7f0e")
-    for model_name, forecast_vals in future_forecasts.items():
-        plt.plot(forecast_dates, forecast_vals, label=f"{model_name} {horizon}-Day Forecast")
+    # Connect forecast lines smoothly by prepending the last historical close price and date
+    last_hist_date = df_target.index[-1]
+    last_hist_val = df_target["Close"].iloc[-1]
+    forecast_dates_extended = pd.DatetimeIndex([last_hist_date]).append(forecast_dates)
 
+    plt.figure(figsize=(16, 8))
+    
+    # Plot historical data and test backtesting lines
+    plt.plot(historical_dates, historical_prices, label="Historical Close", color="#0b3d91", linewidth=2)
+    plt.plot(test_dates, y_test, label="Test Actual", color="#2ca02c", linestyle="--", linewidth=1.5)
+    plt.plot(test_dates, lstm_preds, label="LSTM Test Predictions", color="#ff7f0e", linewidth=1.5)
+    
+    # Plot future forecasts (connected smoothly)
+    for model_name, forecast_vals in future_forecasts.items():
+        forecast_extended = np.insert(forecast_vals, 0, last_hist_val)
+        plt.plot(forecast_dates_extended, forecast_extended, label=f"{model_name} {horizon}-Day Forecast", linewidth=2)
+
+    # Plot nested confidence bands (68% and 95% confidence intervals)
     if confidence is not None and "LSTM" in future_forecasts:
+        lstm_forecast_extended = np.insert(future_forecasts["LSTM"], 0, last_hist_val)
+        confidence_extended = np.insert(confidence, 0, 0.0) # No uncertainty at starting point
+        
         plt.fill_between(
-            forecast_dates,
-            future_forecasts["LSTM"] - confidence,
-            future_forecasts["LSTM"] + confidence,
+            forecast_dates_extended,
+            lstm_forecast_extended - confidence_extended,
+            lstm_forecast_extended + confidence_extended,
             color="#9467bd",
-            alpha=0.2,
-            label="LSTM ±1 Std Confidence",
+            alpha=0.18,
+            label="LSTM ±1 Std Dev (68% CI)",
         )
-    plt.title(f"{ticker} Forecast with Confidence Interval")
-    plt.xlabel("Date")
-    plt.ylabel("Price (IDR)")
-    plt.legend()
-    plt.grid(True)
+        plt.fill_between(
+            forecast_dates_extended,
+            lstm_forecast_extended - 2 * confidence_extended,
+            lstm_forecast_extended + 2 * confidence_extended,
+            color="#9467bd",
+            alpha=0.08,
+            label="LSTM ±2 Std Dev (95% CI)",
+        )
+        
+    # Shade backtesting and future forecast regions
+    if len(test_dates) > 0:
+        plt.axvspan(test_dates[0], test_dates[-1], color="gray", alpha=0.08, label="Backtesting (Test) Period")
+    if len(forecast_dates_extended) > 0:
+        plt.axvspan(forecast_dates_extended[0], forecast_dates_extended[-1], color="blue", alpha=0.04, label="Future Forecast Period")
+
+    plt.title(f"{ticker} Price Forecast with Confidence Interval Bands", fontsize=14, fontweight='bold')
+    plt.xlabel("Date", fontsize=12)
+    plt.ylabel("Price (IDR)", fontsize=12)
+    plt.legend(loc="upper left")
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
 
 def main() -> None:
+    # Plot JCI vs USD/IDR first for market context
+    plot_jci_usd_context(period="1y")
+
     all_stocks_data = download_data(TICKERS, period="5y")
     display(all_stocks_data.head())
 
@@ -1042,6 +1530,14 @@ def main() -> None:
     features = ["Close", "MA50", "MA200", "EMA12", "EMA26", "MACD", "MACD_Signal", "RSI", "BBL", "BBH"]
 
     summary_results: List[Dict[str, Any]] = []
+    # To store forecasts for each model: {model_name: {ticker: forecast_array}}
+    future_forecasts_by_model: Dict[str, Dict[str, np.ndarray]] = {
+        "Naive": {},
+        "ARIMA": {},
+        "LSTM": {},
+        "N-HiTS": {}
+    }
+
     for ticker in TICKERS:
         if ("Close", ticker) not in all_stocks_data.columns:
             logging.warning("Close price data not found for %s, skipping.", ticker)
@@ -1090,8 +1586,59 @@ def main() -> None:
             "best_lstm": best_lstm["params"],
             "best_nhits": best_nhits["best_params"],
         })
+        
+        # Collect future forecasts for all models
+        for model_name, forecast_vals in future_forecasts.items():
+            if forecast_vals is not None and len(forecast_vals) > 0:
+                future_forecasts_by_model[model_name][ticker] = forecast_vals
 
-    compute_portfolio_metrics(all_stocks_data, TICKERS)
+    # Step e & f: Analyze portfolio design, select top 5, allocate weights, and project profits for each model
+    for model_name in ["Naive", "ARIMA", "LSTM", "N-HiTS"]:
+        forecasts = future_forecasts_by_model[model_name]
+        if not forecasts:
+            logging.info("\n===== Skipping portfolio allocation for %s (no forecasts available) =====", model_name)
+            continue
+            
+        logging.info("\n" + "="*80)
+        logging.info(f"PORTFOLIO ALLOCATIONS & ANALYSIS FOR MODEL: {model_name.upper()}")
+        logging.info("="*80)
+
+        # Method 1: Return-Proportional Weighting
+        logging.info("\n----- Running Return-Proportional Portfolio Allocation -----")
+        ret_portfolio_df = analyze_and_allocate_portfolio(
+            all_stocks_data=all_stocks_data,
+            tickers=TICKERS,
+            future_forecasts_all=forecasts,
+            investment_idr=1_000_000_000_000.0,  # 1 Trillion IDR
+            top_n=5,
+            weighting_method="return_proportional",
+            model_name=model_name
+        )
+
+        # Method 2: Markowitz Max Sharpe Ratio Weighting
+        logging.info("\n----- Running Markowitz Max Sharpe Ratio Portfolio Allocation -----")
+        markowitz_portfolio_df = analyze_and_allocate_portfolio(
+            all_stocks_data=all_stocks_data,
+            tickers=TICKERS,
+            future_forecasts_all=forecasts,
+            investment_idr=1_000_000_000_000.0,  # 1 Trillion IDR
+            top_n=5,
+            weighting_method="markowitz",
+            model_name=model_name
+        )
+
+        # Compare portfolio performance metrics
+        if not ret_portfolio_df.empty:
+            logging.info("\n===== %s Model: Return-Proportional Portfolio Metrics Summary =====", model_name)
+            optimized_tickers = ret_portfolio_df["Ticker"].tolist()
+            optimized_weights = ret_portfolio_df["Weight"].tolist()
+            compute_portfolio_metrics(all_stocks_data, optimized_tickers, optimized_weights)
+
+        if not markowitz_portfolio_df.empty:
+            logging.info("\n===== %s Model: Markowitz Portfolio Metrics Summary =====", model_name)
+            optimized_tickers = markowitz_portfolio_df["Ticker"].tolist()
+            optimized_weights = markowitz_portfolio_df["Weight"].tolist()
+            compute_portfolio_metrics(all_stocks_data, optimized_tickers, optimized_weights)
 
 
 if __name__ == "__main__":
